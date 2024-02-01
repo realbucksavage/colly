@@ -79,6 +79,12 @@ type Collector struct {
 	// Leave it blank to allow any URLs to be visited
 	URLFilters []*regexp.Regexp
 
+	// AllowedDomainFunc is called before every request and its return value is
+	// used to test if a domain is allowed to visit.
+	//
+	// Leave it to nil to allow any domains to be visited.
+	AllowedDomainFunc func(ctx context.Context, domain string) (bool, error)
+
 	// AllowURLRevisit allows multiple downloads of the same URL
 	AllowURLRevisit bool
 	// MaxBodySize is the limit of the retrieved response body in bytes.
@@ -376,6 +382,12 @@ func URLFilters(filters ...*regexp.Regexp) CollectorOption {
 	}
 }
 
+func AllowedDomainFunc(fn func(context.Context, string) (bool, error)) CollectorOption {
+	return func(c *Collector) {
+		c.AllowedDomainFunc = fn
+	}
+}
+
 // AllowURLRevisit instructs the Collector to allow multiple downloads of the same URL
 func AllowURLRevisit() CollectorOption {
 	return func(c *Collector) {
@@ -642,7 +654,7 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	// note: once 1.13 is minimum supported Go version,
 	// replace this with http.NewRequestWithContext
 	req = req.WithContext(c.Context)
-	if err := c.requestCheck(parsedURL, method, req.GetBody, depth, checkRevisit); err != nil {
+	if err := c.requestCheck(req.Context(), parsedURL, method, req.GetBody, depth, checkRevisit); err != nil {
 		return err
 	}
 	u = parsedURL.String()
@@ -733,7 +745,7 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 	return err
 }
 
-func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func() (io.ReadCloser, error), depth int, checkRevisit bool) error {
+func (c *Collector) requestCheck(ctx context.Context, parsedURL *url.URL, method string, getBody func() (io.ReadCloser, error), depth int, checkRevisit bool) error {
 	u := parsedURL.String()
 	if c.MaxDepth > 0 && c.MaxDepth < depth {
 		return ErrMaxDepth
@@ -741,7 +753,7 @@ func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func
 	if c.MaxRequests > 0 && c.requestCount >= c.MaxRequests {
 		return ErrMaxRequests
 	}
-	if err := c.checkFilters(u, parsedURL.Hostname()); err != nil {
+	if err := c.checkFilters(ctx, u, parsedURL.Hostname()); err != nil {
 		return err
 	}
 	if method != "HEAD" && !c.IgnoreRobotsTxt {
@@ -779,20 +791,34 @@ func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func
 	return nil
 }
 
-func (c *Collector) checkFilters(URL, domain string) error {
+func (c *Collector) checkFilters(ctx context.Context, URL, domain string) error {
 	if len(c.DisallowedURLFilters) > 0 {
 		if isMatchingFilter(c.DisallowedURLFilters, []byte(URL)) {
 			return ErrForbiddenURL
 		}
 	}
+
 	if len(c.URLFilters) > 0 {
 		if !isMatchingFilter(c.URLFilters, []byte(URL)) {
 			return ErrNoURLFiltersMatch
 		}
 	}
+
 	if !c.isDomainAllowed(domain) {
 		return ErrForbiddenDomain
 	}
+
+	if c.AllowedDomainFunc != nil {
+		ok, err := c.AllowedDomainFunc(ctx, domain)
+		if err != nil {
+			return fmt.Errorf("cannot check if %q is allowed to be visited: %v", domain, err)
+		}
+
+		if !ok {
+			return ErrForbiddenDomain
+		}
+	}
+
 	return nil
 }
 
@@ -1330,7 +1356,7 @@ func (c *Collector) Clone() *Collector {
 
 func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
-		if err := c.checkFilters(req.URL.String(), req.URL.Hostname()); err != nil {
+		if err := c.checkFilters(req.Context(), req.URL.String(), req.URL.Hostname()); err != nil {
 			return fmt.Errorf("Not following redirect to %q: %w", req.URL, err)
 		}
 
